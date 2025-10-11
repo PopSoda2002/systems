@@ -117,5 +117,63 @@ def benchmark():
     average_time = (end_time - start_time) / num_steps
     print(f"Average time per forward + backward pass: {average_time:.4f} seconds")
 
+    compiled_model = torch.compile(model)
+    print("Compiled model created")
+    
+    # Benchmark forward only with compiled model
+    print("\nBenchmarking forward pass only with compiled model...")
+    compiled_model.eval()
+    with torch.no_grad():
+        # Warm-up phase
+        for _ in range(num_warmup_steps):
+            compiled_model(input_ids)
+        
+        torch.cuda.synchronize()
+        start_time = timeit.default_timer()
+        nvtx.range_push("Benchmark - Forward Only with Compiled Model")
+        for _ in range(num_steps):
+            compiled_model(input_ids)
+        nvtx.range_pop()
+        torch.cuda.synchronize()
+        end_time = timeit.default_timer()
+    
+    average_time = (end_time - start_time) / num_steps
+    print(f"Average time per forward pass with compiled model: {average_time:.4f} seconds")
+
+    # Benchmark forward + backward pass with compiled model
+    print("\nBenchmarking forward + backward pass with compiled model...")
+    compiled_model.train()
+    
+    # Warm-up phase
+    nvtx.range_push("Warmup - Forward + Backward with Compiled Model")
+    for _ in range(num_warmup_steps):
+        logits = compiled_model(input_ids)
+        loss = logits.sum()
+        loss.backward()
+        compiled_model.zero_grad()
+    nvtx.range_pop()
+    
+    # Actual benchmark
+    torch.cuda.synchronize()
+    start_time = timeit.default_timer()
+    nvtx.range_push("Benchmark - Forward + Backward with Compiled Model")
+    for _ in range(num_steps):
+        nvtx.range_push("Forward Pass")
+        logits = compiled_model(input_ids)
+        loss = logits.sum()
+        nvtx.range_pop()
+        
+        nvtx.range_push("Backward Pass")
+        loss.backward()
+        nvtx.range_pop()
+        
+        compiled_model.zero_grad()
+    nvtx.range_pop()
+    torch.cuda.synchronize()
+    end_time = timeit.default_timer()
+    
+    average_time = (end_time - start_time) / num_steps
+    print(f"Average time per forward + backward pass with compiled model: {average_time:.4f} seconds")
+
 if __name__ == "__main__":
     benchmark()
