@@ -1,4 +1,4 @@
-from weighted_sum import weighted_sum_fwd
+from weighted_sum import weighted_sum_fwd, weighted_sum_bwd
 import torch
 import triton
 from einops import rearrange
@@ -28,3 +28,24 @@ class WeightedSumFunc(torch.autograd.Function):
         )
 
         return y.view(input_shape[:-1])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        ROW_TILE_SIZE, D_TILE_SIZE = ctx.ROWS_TILE_SIZE, ctx.D_TILE_SIZE
+
+        n_rows, D = x.shape
+
+        partial_grad_weight = torch.empty((triton.cdiv(n_rows, ROW_TILE_SIZE), D), device=x.device, dtype=x.dtype)
+        grad_x = torch.empty_like(x)
+
+        weighted_sum_bwd[(triton.cdiv(n_rows, ROW_TILE_SIZE),)](
+            x, weight,
+            grad_output,
+            grad_x, partial_grad_weight,
+            x.stride(0), x.stride(1), weight.stride(0), grad_output.stride(0), grad_x.stride(0), grad_x.stride(1), partial_grad_weight.stride(0), partial_grad_weight.stride(1), n_rows, D,
+            ROW_TILE_SIZE, D_TILE_SIZE,
+        )
+        grad_weight = partial_grad_weight.sum(axis=0)
+
+        return grad_x, grad_weight
