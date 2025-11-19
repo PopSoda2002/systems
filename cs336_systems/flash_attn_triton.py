@@ -18,140 +18,140 @@ def _flash_attn_fwd_kernel(
     BLOCK_D: tl.constexpr,
 ):
     """
-    FlashAttention-2 前向传播 Triton kernel
+    FlashAttention-2 forward pass Triton kernel
     
-    参数:
-        Q, K, V: 输入张量指针
-        O: 输出张量指针
-        L: logsumexp 输出指针
-        stride_*: 各张量的步长
-        N: 序列长度
-        d: 特征维度
-        BLOCK_M: Q 的块大小 (Br)
-        BLOCK_N: K/V 的块大小 (Bc)
-        BLOCK_D: 特征维度块大小
+    Args:
+        Q, K, V: Input tensor pointers
+        O: Output tensor pointer
+        L: logsumexp output pointer
+        stride_*: Strides for each tensor
+        N: Sequence length
+        d: Feature dimension
+        BLOCK_M: Block size for Q (Br)
+        BLOCK_N: Block size for K/V (Bc)
+        BLOCK_D: Feature dimension block size
     """
-    # 获取当前块的索引
+    # Get the current block index
     pid_m = tl.program_id(0)
     
-    # 计算当前块处理的行范围
+    # Calculate the row range for the current block
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
     
-    # 创建掩码，确保不越界
+    # Create mask to ensure no out-of-bounds access
     mask_m = offs_m < N
     
-    # 计算 Q_i 的指针
+    # Calculate pointers for Q_i
     q_ptrs = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
     
-    # 加载 Q_i 到 SRAM
+    # Load Q_i to SRAM
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
     
-    # 初始化输出累加器、统计量
+    # Initialize output accumulator and statistics
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     m_i = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     
-    # 内层循环：遍历 K, V 的所有块
+    # Inner loop: iterate over all blocks of K, V
     num_blocks_n = tl.cdiv(N, BLOCK_N)
     
     for start_n in range(0, num_blocks_n):
-        # 计算当前处理的列范围
+        # Calculate the column range for the current block
         offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
         
-        # 加载 K_j 到 SRAM
+        # Load K_j to SRAM
         k_ptrs = K + offs_n[:, None] * stride_km + offs_d[None, :] * stride_kd
         k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
         
-        # 加载 V_j 到 SRAM
+        # Load V_j to SRAM
         v_ptrs = V + offs_n[:, None] * stride_vm + offs_d[None, :] * stride_vd
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
         
-        # 计算注意力分数 S_ij = Q_i @ K_j^T
+        # Compute attention scores S_ij = Q_i @ K_j^T
         s_ij = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         s_ij += tl.dot(q, tl.trans(k))
         
-        # 创建有效掩码
+        # Create valid mask
         mask_ij = mask_m[:, None] & mask_n[None, :]
         s_ij = tl.where(mask_ij, s_ij, float("-inf"))
         
-        # 计算行最大值: m_ij = max(m_i, rowmax(S_ij))
+        # Compute row maximum: m_ij = max(m_i, rowmax(S_ij))
         m_ij = tl.maximum(m_i, tl.max(s_ij, axis=1))
         
-        # 计算注意力权重: P_ij = exp(S_ij - m_ij)
+        # Compute attention weights: P_ij = exp(S_ij - m_ij)
         p_ij = tl.exp(s_ij - m_ij[:, None])
         
-        # 更新归一化因子: l_ij = exp(m_i - m_ij) * l_i + rowsum(P_ij)
+        # Update normalization factor: l_ij = exp(m_i - m_ij) * l_i + rowsum(P_ij)
         alpha = tl.exp(m_i - m_ij)
         l_ij = alpha * l_i + tl.sum(p_ij, axis=1)
         
-        # 更新输出累加器
+        # Update output accumulator
         # O_i = diag(alpha) @ O_i + P_ij @ V_j
         acc = acc * alpha[:, None]
         acc += tl.dot(p_ij.to(v.dtype), v)
         
-        # 更新统计量
+        # Update statistics
         m_i = m_ij
         l_i = l_ij
     
-    # 最终归一化: O_i = diag(1/l_i) @ O_i
+    # Final normalization: O_i = diag(1/l_i) @ O_i
     acc = acc / l_i[:, None]
     
-    # 计算 logsumexp: L_i = m_i + log(l_i)
+    # Compute logsumexp: L_i = m_i + log(l_i)
     l_out = m_i + tl.log(l_i)
     
-    # 将结果写回 HBM
+    # Write results back to HBM
     o_ptrs = O + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
     tl.store(o_ptrs, acc, mask=mask_m[:, None])
     
-    # 写回 logsumexp
+    # Write back logsumexp
     l_ptrs = L + offs_m
     tl.store(l_ptrs, l_out, mask=mask_m)
 
 
 def flash_attn_triton_forward(Q, K, V, block_m=64, block_n=64):
     """
-    FlashAttention-2 前向传播的 Triton 实现
+    Triton implementation of FlashAttention-2 forward pass
     
-    参数:
-        Q: Query 矩阵，形状 (N, d)
-        K: Key 矩阵，形状 (N, d)
-        V: Value 矩阵，形状 (N, d)
-        block_m: Q 的块大小 (默认 64)
-        block_n: K/V 的块大小 (默认 64)
+    Args:
+        Q: Query matrix, shape (N, d)
+        K: Key matrix, shape (N, d)
+        V: Value matrix, shape (N, d)
+        block_m: Block size for Q (default 64)
+        block_n: Block size for K/V (default 64)
     
-    返回:
-        O: 输出矩阵，形状 (N, d)
-        L: logsumexp，形状 (N,)
+    Returns:
+        O: Output matrix, shape (N, d)
+        L: logsumexp, shape (N,)
     """
-    # 检查输入形状
-    assert Q.shape == K.shape == V.shape, "Q, K, V 必须有相同的形状"
+    # Check input shapes
+    assert Q.shape == K.shape == V.shape, "Q, K, V must have the same shape"
     N, d = Q.shape
     
-    # 确保在同一设备上
-    assert Q.device == K.device == V.device, "Q, K, V 必须在同一设备上"
+    # Ensure on the same device
+    assert Q.device == K.device == V.device, "Q, K, V must be on the same device"
     device = Q.device
     
-    # 分配输出张量
+    # Allocate output tensors
     O = torch.empty_like(Q)
     L = torch.empty(N, device=device, dtype=Q.dtype)
     
-    # 获取步长
+    # Get strides
     stride_qm, stride_qd = Q.stride()
     stride_km, stride_kd = K.stride()
     stride_vm, stride_vd = V.stride()
     stride_om, stride_od = O.stride()
     
-    # 设置块大小
+    # Set block sizes
     BLOCK_M = block_m
     BLOCK_N = block_n
     BLOCK_D = triton.next_power_of_2(d)
     
-    # 计算网格大小
+    # Calculate grid size
     grid = (triton.cdiv(N, BLOCK_M),)
     
-    # 启动 kernel
+    # Launch kernel
     _flash_attn_fwd_kernel[grid](
         Q, K, V, O, L,
         stride_qm, stride_qd,
@@ -169,32 +169,32 @@ def flash_attn_triton_forward(Q, K, V, block_m=64, block_n=64):
 
 class FlashAttnTriton(torch.autograd.Function):
     """
-    FlashAttention-2 的 PyTorch autograd.Function 封装
+    PyTorch autograd.Function wrapper for FlashAttention-2
     """
     @staticmethod
     def forward(ctx, Q, K, V, block_m=64, block_n=64):
         """
-        前向传播
+        Forward pass
         
-        参数:
-            Q: Query 矩阵，形状 (N, d)
-            K: Key 矩阵，形状 (N, d)
-            V: Value 矩阵，形状 (N, d)
-            block_m: Q 的块大小
-            block_n: K/V 的块大小
+        Args:
+            Q: Query matrix, shape (N, d)
+            K: Key matrix, shape (N, d)
+            V: Value matrix, shape (N, d)
+            block_m: Block size for Q
+            block_n: Block size for K/V
         
-        返回:
-            O: 输出矩阵，形状 (N, d)
+        Returns:
+            O: Output matrix, shape (N, d)
         """
-        # 确保输入是连续的
+        # Ensure inputs are contiguous
         Q = Q.contiguous()
         K = K.contiguous()
         V = V.contiguous()
         
-        # 调用 Triton kernel
+        # Call Triton kernel
         O, L = flash_attn_triton_forward(Q, K, V, block_m, block_n)
         
-        # 保存用于反向传播
+        # Save for backward pass
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.block_m = block_m
         ctx.block_n = block_n
@@ -203,28 +203,28 @@ class FlashAttnTriton(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, dO):
-        raise NotImplementedError("反向传播尚未实现")
+        raise NotImplementedError("Backward pass not yet implemented")
 
 
 def flash_attention_triton(Q, K, V, block_m=64, block_n=64):
     """
-    FlashAttention-2 的便捷接口
+    Convenience interface for FlashAttention-2
     
-    参数:
-        Q: Query 矩阵，形状 (N, d) 或 (batch, N, d)
-        K: Key 矩阵，形状 (N, d) 或 (batch, N, d)
-        V: Value 矩阵，形状 (N, d) 或 (batch, N, d)
-        block_m: Q 的块大小
-        block_n: K/V 的块大小
+    Args:
+        Q: Query matrix, shape (N, d) or (batch, N, d)
+        K: Key matrix, shape (N, d) or (batch, N, d)
+        V: Value matrix, shape (N, d) or (batch, N, d)
+        block_m: Block size for Q
+        block_n: Block size for K/V
     
-    返回:
-        O: 输出矩阵，与输入形状相同
+    Returns:
+        O: Output matrix, same shape as input
     """
     return FlashAttnTriton.apply(Q, K, V, block_m, block_n)
 
 
 if __name__ == "__main__":
-    # 简单测试
+    # Simple test
     torch.manual_seed(42)
     N, d = 256, 64
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -234,18 +234,18 @@ if __name__ == "__main__":
         K = torch.randn(N, d, device=device, dtype=torch.float32)
         V = torch.randn(N, d, device=device, dtype=torch.float32)
         
-        # Triton 实现
+        # Triton implementation
         O_triton = flash_attention_triton(Q, K, V)
         
-        # 标准实现（用于验证）
+        # Standard implementation (for validation)
         scores = Q @ K.T
         attn = torch.softmax(scores, dim=-1)
         O_ref = attn @ V
         
-        # 比较结果
-        print(f"输出形状: {O_triton.shape}")
-        print(f"最大差异: {torch.max(torch.abs(O_triton - O_ref)).item():.6f}")
-        print(f"相对误差: {torch.mean(torch.abs(O_triton - O_ref) / (torch.abs(O_ref) + 1e-5)).item():.6f}")
+        # Compare results
+        print(f"Output shape: {O_triton.shape}")
+        print(f"Max difference: {torch.max(torch.abs(O_triton - O_ref)).item():.6f}")
+        print(f"Relative error: {torch.mean(torch.abs(O_triton - O_ref) / (torch.abs(O_ref) + 1e-5)).item():.6f}")
     else:
-        print("需要 CUDA 设备来运行 Triton kernel")
+        print("CUDA device required to run Triton kernel")
 
